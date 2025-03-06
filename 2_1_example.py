@@ -130,7 +130,7 @@ def train(config: Config) -> ResidualMLPModel:
     np.random.seed(seed)
 
     model = ResidualMLPModel(config).to(config.device)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=config.lr, weight_decay=0.01)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=config.lr, weight_decay=0)
 
     dataset = SparseFeatureDataset(config)
 
@@ -217,56 +217,121 @@ def plot_outputs(model: ResidualMLPModel, config: Config) -> plt.Figure:
     active_features = torch.where(batch[0] != 0)[0]
     ax.set_title(f"Outputs for batch with features {active_features.tolist()}")
     ax.legend()
-    fig = ax.get_figure()
+    return fig
+
+
+def plot_2_feature_cases(model: ResidualMLPModel, config: Config) -> plt.Figure:
+    fig, ax = plt.subplots()
+    batch = torch.zeros((100, config.n_features), device=config.device)
+    batch[:, 0] = torch.linspace(-1, 1, 100)
+    with torch.no_grad():
+        outputs = model(batch)
+    ax.plot(
+        batch[:, 0].cpu(),
+        outputs[:, 0].cpu(),
+        label=f"feature 0, when feature 1 active",
+        color="C0",
+        ls="-",
+    )
+    ax.plot(
+        batch[:, 0].cpu(),
+        outputs[:, 1].cpu(),
+        label=f"feature 0, when feature 1 inactive",
+        color="C0",
+        ls=":",
+    )
+
+    batch[:, 0] = 0
+    batch[:, 1] = torch.linspace(-1, 1, 100)
+    with torch.no_grad():
+        outputs = model(batch)
+    ax.plot(
+        batch[:, 1].cpu(),
+        outputs[:, 0].cpu(),
+        label=f"feature 1, when feature 0 active",
+        color="C1",
+        ls="-",
+    )
+    ax.plot(
+        batch[:, 1].cpu(),
+        outputs[:, 1].cpu(),
+        label=f"feature 1, when feature 0 inactive",
+        color="C1",
+        ls=":",
+    )
+    ax.legend()
     return fig
 
 
 if __name__ == "__main__":
     config = Config(
-        n_features=100,
-        d_embed=1000,
-        d_mlp=50,
-        feature_probability=0.01,
-        embed="random",
-        steps=10_000,
+        n_features=2,
+        d_embed=2,
+        d_mlp=1,
+        feature_probability=0.1,
+        embed="identity",
+        steps=5_000,
         batch_size=2048,
         device="cuda" if torch.cuda.is_available() else "cpu",
     )
-    # Train model for different numbers of training steps
     models = []
-    training_steps = [1_000, 2_000, 5_000, 10_000, 20_000]
-    for n_train in training_steps:
-        config.steps = n_train
+    for _ in range(50):
         model = train(config)
         models.append(model)
-    config.steps = 10_000
-    fig = plot_loss_of_input_sparsity(
-        models,
-        labels=[f"{n_train} steps" for n_train in training_steps],
-        feature_probabilities=np.geomspace(0.001, 1, 100),
-        config=config,
-    )
-    fig.suptitle(f"Loss as a function of input sparsity (embeds={config.embed})")
-    fig.get_axes()[0].legend(title="Training steps")
-    fig.savefig(f"loss_of_input_sparsity_vs_training_steps_{config.embed}.png")
+
+    fig = plot_outputs(models[-1], config)
     fig.show()
-    # Train model at training different sparsities
-    models = []
-    training_feature_probabilities = np.geomspace(0.001, 1, 7)
-    for feature_probability in training_feature_probabilities:
-        config.feature_probability = feature_probability
-        model = train(config)
-        models.append(model)
-    config.feature_probability = 0.01
-    fig = plot_loss_of_input_sparsity(
-        models,
-        labels=[
-            f"{feature_probability:.2e}" for feature_probability in training_feature_probabilities
-        ],
-        feature_probabilities=np.geomspace(0.001, 1, 100),
-        config=config,
-    )
-    fig.suptitle(f"Loss as a function of input sparsity (embeds={config.embed})")
-    fig.get_axes()[0].legend(title="Training feature probability")
-    fig.savefig(f"loss_of_input_sparsity_vs_training_feature_probabilities_{config.embed}.png")
+    fig = plot_2_feature_cases(models[-1], config)
+    fig.show()
+    print("Naive loss:", naive_loss(config.n_features, config.d_mlp, config.feature_probability))
+
+    fig, [[ax1, ax2], [ax3, ax4], [ax5, ax6]] = plt.subplots(3, 2, figsize=(15, 15))
+    dataset = SparseFeatureDataset(config)
+
+    losses = []
+    for model in models:
+        loss = evaluate(model, dataset, batch_size=10_000)
+        losses.append(loss)
+
+    norm = plt.Normalize(vmin=min(losses), vmax=max(losses))
+
+    for i, model in enumerate(models):
+        print(f"Model {i} weights:")
+        print("W_in:", model.mlp.mlp_in.cpu().detach().numpy().flatten())
+        print("W_out:", model.mlp.mlp_out.cpu().detach().numpy().flatten())
+        loss = losses[i]
+        print("Loss:", loss)
+        color = plt.cm.viridis(norm(loss))
+
+        # Plot scatter of W_in
+        Win = model.mlp.mlp_in.cpu().detach().numpy().flatten()
+        ax1.scatter(Win[0], Win[1], s=10, color=color)
+        ax1.set_xlabel("W_in feature 0")
+        ax1.set_ylabel("W_in feature 1")
+
+        Wout = model.mlp.mlp_out.cpu().detach().numpy().flatten()
+        ax2.scatter(Wout[0], Wout[1], s=10, color=color)
+        ax2.set_xlabel("W_out feature 0")
+        ax2.set_ylabel("W_out feature 1")
+
+        # Product of W_in and W_out
+        ax3.scatter(Win[0] * Wout[0], Win[1] * Wout[1], s=10, color=color)
+        ax3.set_xlabel("W_in feature 0 * W_out feature 0")
+        ax3.set_ylabel("W_in feature 1 * W_out feature 1")
+
+        ax4.scatter(Win[0] * Wout[1], Win[1] * Wout[0], s=10, color=color)
+        ax4.set_xlabel("W_in feature 0 * W_out feature 1")
+        ax4.set_ylabel("W_in feature 1 * W_out feature 0")
+
+        ax5.scatter(Win[0] * Wout[0], Win[0] * Wout[1], s=10, color=color)
+        ax5.set_xlabel("W_in feature 0 * W_out feature 0")
+        ax5.set_ylabel("W_in feature 0 * W_out feature 1")
+
+        ax6.scatter(Win[0] * Wout[0], Win[1] * Wout[0], s=10, color=color)
+        ax6.set_xlabel("W_in feature 0 * W_out feature 0")
+        ax6.set_ylabel("W_in feature 1 * W_out feature 0")
+
+    # Add colorbar
+    sm = plt.cm.ScalarMappable(cmap="viridis", norm=norm)
+    fig.colorbar(sm, ax=[ax1, ax2, ax3, ax4, ax5, ax6], label="Loss")
     fig.show()
