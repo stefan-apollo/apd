@@ -1,4 +1,4 @@
-"""Trains a residual linear model on one-hot input vectors."""
+"""Trains a residual linear model on one-hot input vectors and evaluates it across sparsity levels."""
 
 import json
 from datetime import datetime
@@ -6,6 +6,8 @@ from pathlib import Path
 from typing import Literal, Self
 
 import einops
+import matplotlib.pyplot as plt
+import numpy as np
 import torch
 import wandb
 import yaml
@@ -28,6 +30,24 @@ from spd.utils import (
 from spd.wandb_utils import init_wandb
 
 wandb.require("core")
+
+
+def naive_loss(n_features: int, d_mlp: int, p: float, bias: bool, embed: str) -> float:
+    if embed == "random" or embed == "identity":
+        if bias:
+            loss = (n_features - d_mlp) * (8 - 3 * p) * p / 48
+        else:
+            # d_mlp features perfectly (loss 0), the others not at all (loss 1/6
+            # because 0.5*\int_0^1 x^2 = 1/3 if active) so (n_features - d_mlp) * 1/6 * p
+            loss = (n_features - d_mlp) * p / 6
+    elif embed == "trained":
+        if bias:
+            loss = (n_features - d_mlp) * (4 - 3 * p) * p / 48
+        else:
+            loss = (n_features - d_mlp) * p / 12
+    else:
+        raise ValueError(f"Unknown embedding type {embed}")
+    return loss / n_features
 
 
 class ResidMLPTrainConfig(BaseModel):
@@ -53,6 +73,8 @@ class ResidMLPTrainConfig(BaseModel):
     fixed_random_embedding: bool = False
     fixed_identity_embedding: bool = False
     n_batches_final_losses: PositiveInt = 1
+    eval_sparsities: list[float] = [0.001, 0.005, 0.01, 0.02, 0.05, 0.1, 0.2]
+    eval_batches: PositiveInt = 10
 
     @model_validator(mode="after")
     def validate_model(self) -> Self:
@@ -97,6 +119,56 @@ def loss_function(
     return loss
 
 
+def evaluate_model_at_sparsity(
+    model: ResidualMLPModel,
+    sparsity: float,
+    config: ResidMLPTrainConfig,
+    device: str,
+    train_dataloader: DatasetGeneratedDataLoader[
+        tuple[
+            Float[Tensor, "batch n_instances n_features"],
+            Float[Tensor, "batch n_instances d_embed"],
+        ]
+    ],
+) -> Float[Tensor, " n_instances"]:
+    """Evaluate model performance at a given sparsity level."""
+    dataset = ResidualMLPDataset(
+        n_instances=config.resid_mlp_config.n_instances,
+        n_features=config.resid_mlp_config.n_features,
+        feature_probability=sparsity,
+        device=device,
+        calc_labels=True,
+        label_type=config.label_type,
+        act_fn_name=config.resid_mlp_config.act_fn_name,
+        label_fn_seed=config.label_fn_seed,
+        label_coeffs=train_dataloader.dataset.label_coeffs,
+        data_generation_type=config.data_generation_type,
+        synced_inputs=config.synced_inputs,
+    )
+    dataloader = DatasetGeneratedDataLoader(dataset, batch_size=config.batch_size, shuffle=False)
+    # print("dataset.label_coeffs", dataset.label_coeffs)
+    feature_importances = compute_feature_importances(
+        batch_size=config.batch_size,
+        n_instances=config.resid_mlp_config.n_instances,
+        n_features=config.resid_mlp_config.n_features,
+        importance_val=config.importance_val,
+        device=device,
+    )
+
+    losses = []
+    for _ in range(config.eval_batches):
+        batch, labels = next(iter(dataloader))
+        batch = batch.to(device)
+        labels = labels.to(device)
+        with torch.no_grad():
+            out = model(batch, return_residual=config.loss_type == "resid")
+            assert torch.allclose(feature_importances, torch.ones_like(feature_importances))
+            loss = loss_function(out, labels, feature_importances, model, config)
+            loss = loss.mean(dim=(0, 2)).item()
+        losses.append(loss)
+    return torch.tensor(losses).mean()
+
+
 def train(
     config: ResidMLPTrainConfig,
     model: ResidualMLPModel,
@@ -111,7 +183,7 @@ def train(
     device: str,
     out_dir: Path,
     run_name: str,
-) -> Float[Tensor, " n_instances"]:
+) -> tuple[Float[Tensor, " n_instances"], dict[float, Float[Tensor, " n_instances"]]]:
     if config.wandb_project:
         config = init_wandb(config, config.wandb_project, name=run_name)
 
@@ -166,7 +238,9 @@ def train(
         loss.backward()
         optimizer.step()
         if step % config.print_freq == 0:
-            tqdm.write(f"step {step}: loss={current_losses.mean():.2e}, lr={current_lr:.2e}")
+            tqdm.write(
+                f"step {step}: loss={current_losses.mean():.2e} [{current_losses.shape}], lr={current_lr:.2e}"
+            )
             if config.wandb_project:
                 wandb.log({"loss": current_losses.mean(), "lr": current_lr}, step=step)
 
@@ -187,8 +261,39 @@ def train(
         loss = loss.mean(dim=(0, 2))
         final_losses.append(loss)
     final_losses = torch.stack(final_losses).mean(dim=0).cpu().detach()
-    print(f"Final losses: {final_losses.numpy()}")
-    return final_losses
+    print(f"Final losses at training sparsity: {final_losses}")
+
+    # Evaluate model at different sparsity levels
+    sparsity_losses = {}
+    for sparsity in config.eval_sparsities:
+        losses = evaluate_model_at_sparsity(
+            model, sparsity, config, device, train_dataloader=dataloader
+        )
+        sparsity_losses[sparsity] = losses
+        print(f"Losses at sparsity {sparsity}: {losses}")
+        if config.wandb_project:
+            wandb.log({f"eval_loss_sparsity_{sparsity}": losses.mean()})
+
+    # Plot sparsity vs loss
+    plt.figure(figsize=(10, 6))
+    sparsities = sorted(sparsity_losses.keys())
+    losses = [sparsity_losses[s].mean().item() for s in sparsities]
+    plt.plot(sparsities, losses, "-o")
+    plt.xscale("log")
+    plt.yscale("log")
+    plt.xlabel("Feature probability (1-S)")
+    plt.ylabel("Loss L")
+    plt.title("Model Performance vs Input Sparsity")
+    plt.grid(True)
+
+    plot_path = out_dir / "sparsity_vs_loss.png"
+    plt.savefig(plot_path)
+    print(f"Saved sparsity vs loss plot to {plot_path}")
+    if config.wandb_project:
+        wandb.log({"sparsity_vs_loss": wandb.Image(str(plot_path))})
+    plt.close()
+
+    return final_losses, sparsity_losses
 
 
 def run_train(config: ResidMLPTrainConfig, device: str) -> Float[Tensor, " n_instances"]:
@@ -257,7 +362,7 @@ def run_train(config: ResidMLPTrainConfig, device: str) -> Float[Tensor, " n_ins
         device=device,
     )
 
-    final_losses = train(
+    final_losses, sparsity_losses = train(
         config=config,
         model=model,
         trainable_params=[p for p in model.parameters() if p.requires_grad],
@@ -267,7 +372,7 @@ def run_train(config: ResidMLPTrainConfig, device: str) -> Float[Tensor, " n_ins
         out_dir=out_dir,
         run_name=run_name,
     )
-    return final_losses
+    return final_losses, sparsity_losses
 
 
 if __name__ == "__main__":
@@ -291,7 +396,6 @@ if __name__ == "__main__":
         loss_type="readoff",
         use_trivial_label_coeffs=True,
         feature_probability=0.01,
-        # synced_inputs=[[0, 1], [2, 3]], # synced inputs
         importance_val=1,
         data_generation_type="at_least_zero_active",
         batch_size=2048,
@@ -301,9 +405,38 @@ if __name__ == "__main__":
         lr_schedule="cosine",
         fixed_random_embedding=True,
         fixed_identity_embedding=False,
-        n_batches_final_losses=10,
+        n_batches_final_losses=100,
+        eval_sparsities=np.geomspace(0.001, 1, 100),
+        eval_batches=100,
     )
 
     set_seed(config.seed)
 
-    run_train(config, device)
+    final_losses, sparsity_losses = run_train(config, device)
+    # Plot sparsity vs loss
+    plt.figure(figsize=(10, 6))
+    sparsities = np.array(sorted(sparsity_losses.keys()))
+    losses = np.array([sparsity_losses[s].mean().item() for s in sparsities])
+    plt.loglog(sparsities, losses / sparsities, "-o")
+    plt.xlabel("Feature probability (1-S)")
+    plt.ylabel("Adjusted loss L/(1-S)")
+    plt.title("Model Performance vs Input Sparsity")
+    plt.grid(True)
+    naive_losses = np.array(
+        [
+            naive_loss(
+                config.resid_mlp_config.n_features,
+                config.resid_mlp_config.d_mlp,
+                p,
+                config.resid_mlp_config.in_bias,
+                "random",
+            )
+            for p in sparsities
+        ]
+    )
+    plt.loglog(sparsities, naive_losses / sparsities, "--", label="Naive loss")
+    plt.legend()
+
+    plot_path = Path(__file__).parent / "out" / "sparsity_vs_loss.png"
+    plt.savefig(plot_path)
+    print(f"Saved sparsity vs loss plot to {plot_path}")
