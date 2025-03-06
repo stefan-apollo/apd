@@ -1,5 +1,6 @@
 from collections.abc import Iterable
 from dataclasses import dataclass
+from typing import Literal
 
 import einops
 import matplotlib.pyplot as plt
@@ -12,6 +13,7 @@ from tqdm import tqdm
 
 
 def naive_loss(n_features: int, d_mlp: int, p: float) -> float:
+    """Naive loss from monosemantic ReLUs and orthogonal(!) embeddings."""
     return (n_features - d_mlp) / n_features * p / 6
 
 
@@ -22,10 +24,11 @@ class Config:
     n_features: int = 100
     d_embed: int = 1000
     d_mlp: int = 50
+    embed: Literal["random", "identity"] = "random"
     seed: int = 0
     feature_probability: float = 0.01
     batch_size: int = 2048
-    steps: int = 10000
+    steps: int = 10_000
     lr: float = 3e-3
     print_freq: int = 500
     device: str = "cuda"
@@ -67,9 +70,16 @@ class ResidualMLPModel(nn.Module):
         super().__init__()
         self.config = config
 
-        W_E: Float[Tensor, "n_features d_embed"] = torch.randn(
-            config.n_features, config.d_embed, device=config.device
-        )
+        if config.embed == "random":
+            W_E: Float[Tensor, "n_features d_embed"] = torch.randn(
+                config.n_features, config.d_embed, device=config.device
+            )
+        elif config.embed == "identity":
+            W_E: Float[Tensor, "n_features d_embed"] = torch.eye(
+                config.n_features, config.d_embed, device=config.device
+            )
+        else:
+            raise ValueError(f"Unknown embedding type {config.embed}")
         W_E = F.normalize(W_E, dim=1)
         self.register_buffer("W_E", W_E)
 
@@ -188,7 +198,6 @@ def plot_loss_of_input_sparsity(
     ax.set_yscale("log")
     ax.set_xlabel("Feature probability p = (1-S)")
     ax.set_ylabel("Adjusted loss L / (1-S)")
-    ax.set_title("Loss of input sparsity")
     ax.legend(ncols=3, loc="lower center")
     fig = ax.get_figure()
     return fig
@@ -217,13 +226,14 @@ if __name__ == "__main__":
         d_embed=1000,
         d_mlp=50,
         feature_probability=0.01,
+        embed="random",
         steps=10_000,
         batch_size=2048,
         device="cuda" if torch.cuda.is_available() else "cpu",
     )
     # Train model for different numbers of training steps
     models = []
-    training_steps = [100, 2000, 5000, 10000, 20000, 50000]
+    training_steps = [1_000, 2_000, 5_000, 10_000, 20_000]
     for n_train in training_steps:
         config.steps = n_train
         model = train(config)
@@ -235,11 +245,13 @@ if __name__ == "__main__":
         feature_probabilities=np.geomspace(0.001, 1, 100),
         config=config,
     )
-    fig.savefig("loss_of_input_sparsity_vs_training_steps.png")
+    fig.suptitle(f"Loss as a function of input sparsity (embeds={config.embed})")
+    fig.get_axes()[0].legend(title="Training steps")
+    fig.savefig(f"loss_of_input_sparsity_vs_training_steps_{config.embed}.png")
     fig.show()
     # Train model at training different sparsities
     models = []
-    training_feature_probabilities = np.geomspace(0.001, 1, 10)
+    training_feature_probabilities = np.geomspace(0.001, 1, 7)
     for feature_probability in training_feature_probabilities:
         config.feature_probability = feature_probability
         model = train(config)
@@ -253,7 +265,7 @@ if __name__ == "__main__":
         feature_probabilities=np.geomspace(0.001, 1, 100),
         config=config,
     )
-    ax = fig.get_axes()[0]
-    ax.set_title("Loss of input sparsity for different training feature probabilities")
-    fig.savefig("loss_of_input_sparsity_vs_training_feature_probabilities.png")
+    fig.suptitle(f"Loss as a function of input sparsity (embeds={config.embed})")
+    fig.get_axes()[0].legend(title="Training feature probability")
+    fig.savefig(f"loss_of_input_sparsity_vs_training_feature_probabilities_{config.embed}.png")
     fig.show()
