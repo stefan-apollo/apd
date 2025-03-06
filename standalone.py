@@ -1,3 +1,4 @@
+from collections.abc import Iterable
 from dataclasses import dataclass
 
 import einops
@@ -5,37 +6,29 @@ import matplotlib.pyplot as plt
 import numpy as np
 import torch
 import torch.nn.functional as F
+from jaxtyping import Float
 from torch import Tensor, nn
 from tqdm import tqdm
 
 
-def naive_loss(n_features: int, d_mlp: int, p: float, embed: str) -> float:
-    if embed == "random" or embed == "identity":
-        # d_mlp features perfectly (loss 0), the others not at all (loss 1/6
-        # because 0.5*\int_0^1 x^2 = 1/3 if active) so (n_features - d_mlp) * 1/6 * p
-        loss = (n_features - d_mlp) * p / 6
-    else:
-        raise ValueError(f"Unknown embedding type {embed}")
-    return loss / n_features
+def naive_loss(n_features: int, d_mlp: int, p: float) -> float:
+    return (n_features - d_mlp) / n_features * p / 6
 
 
 @dataclass
 class Config:
     """Configuration for the ResidualMLP model and training."""
 
-    # Model parameters
-    n_features: int = 100  # Number of input features
-    d_embed: int = 100  # Embedding dimension
-    d_mlp: int = 50  # Hidden layer size
-    n_instances: int = 1  # Number of model instances
-
-    # Training parameters
+    n_features: int = 100
+    d_embed: int = 1000
+    d_mlp: int = 50
     seed: int = 0
-    feature_probability: float = 0.01  # Probability of a feature being active
-    batch_size: int = 256
-    steps: int = 5000
+    feature_probability: float = 0.01
+    batch_size: int = 2048
+    steps: int = 10000
     lr: float = 3e-3
     print_freq: int = 500
+    device: str = "cuda"
 
 
 class MLP(nn.Module):
@@ -45,43 +38,24 @@ class MLP(nn.Module):
         self,
         d_model: int,
         d_mlp: int,
-        n_instances: int = 1,
     ):
         super().__init__()
-        self.n_instances = n_instances
         self.d_model = d_model
         self.d_mlp = d_mlp
 
-        # Initialize weights
-        self.mlp_in = nn.Parameter(torch.empty(n_instances, d_model, d_mlp))
-        self.mlp_out = nn.Parameter(torch.empty(n_instances, d_mlp, d_model))
+        self.mlp_in: Float[Tensor, "d_model d_mlp"] = nn.Parameter(torch.empty(d_model, d_mlp))
+        self.mlp_out: Float[Tensor, "d_mlp d_model"] = nn.Parameter(torch.empty(d_mlp, d_model))
 
-        # Initialize parameters with Kaiming initialization
         nn.init.kaiming_uniform_(self.mlp_in)
         nn.init.kaiming_uniform_(self.mlp_out)
 
-        # No bias in this implementation for simplicity
-
-    def forward(self, x: Tensor) -> Tensor:
-        """
-        Forward pass through the MLP.
-
-        Args:
-            x: Input tensor of shape [batch, n_instances, d_model]
-
-        Returns:
-            Output tensor of shape [batch, n_instances, d_model]
-        """
-        mid_pre_act = einops.einsum(
-            x,
-            self.mlp_in,
-            "batch n_instances d_model, n_instances d_model d_mlp -> batch n_instances d_mlp",
+    def forward(self, x: Float[Tensor, "batch d_model"]) -> Float[Tensor, "batch d_model"]:
+        mid_pre_act: Float[Tensor, "batch d_mlp"] = einops.einsum(
+            x, self.mlp_in, "batch d_model, d_model d_mlp -> batch d_mlp"
         )
-        mid = F.relu(mid_pre_act)
-        out = einops.einsum(
-            mid,
-            self.mlp_out,
-            "batch n_instances d_mlp, n_instances d_mlp d_model -> batch n_instances d_model",
+        mid: Float[Tensor, "batch d_mlp"] = F.relu(mid_pre_act)
+        out: Float[Tensor, "batch d_model"] = einops.einsum(
+            mid, self.mlp_out, "batch d_mlp, d_mlp d_model -> batch d_model"
         )
         return out
 
@@ -93,49 +67,26 @@ class ResidualMLPModel(nn.Module):
         super().__init__()
         self.config = config
 
-        # Embedding matrices
-        self.W_E = nn.Parameter(torch.empty(config.n_instances, config.n_features, config.d_embed))
-        self.W_U = nn.Parameter(torch.empty(config.n_instances, config.d_embed, config.n_features))
+        W_E: Float[Tensor, "n_features d_embed"] = torch.randn(
+            config.n_features, config.d_embed, device=config.device
+        )
+        W_E = F.normalize(W_E, dim=1)
+        self.register_buffer("W_E", W_E)
 
-        # Initialize embedding matrices
-        nn.init.normal_(self.W_E, std=0.02)
-        nn.init.normal_(self.W_U, std=0.02)
-
-        # Create the MLP layer
         self.mlp = MLP(
             d_model=config.d_embed,
             d_mlp=config.d_mlp,
-            n_instances=config.n_instances,
         )
 
-    def forward(self, x: Tensor) -> Tensor:
-        """
-        Forward pass through the ResidualMLP model.
-
-        Args:
-            x: Input tensor of shape [batch, n_instances, n_features]
-
-        Returns:
-            Output tensor of shape [batch, n_instances, n_features]
-        """
-        # Project input to embedding space
+    def forward(self, x: Float[Tensor, "batch n_features"]) -> Float[Tensor, "batch n_features"]:
         residual = einops.einsum(
-            x,
-            self.W_E,
-            "batch n_instances n_features, n_instances n_features d_embed -> batch n_instances d_embed",
+            x, self.W_E, "batch n_features, n_features d_embed -> batch d_embed"
         )
-
-        # Apply MLP with residual connection
-        out = self.mlp(residual)
-        residual = residual + out
-
-        # Project back to feature space
-        out = einops.einsum(
-            residual,
-            self.W_U,
-            "batch n_instances d_embed, n_instances d_embed n_features -> batch n_instances n_features",
+        mlp_out: Float[Tensor, "batch d_embed"] = self.mlp(residual)
+        residual = residual + mlp_out
+        out: Float[Tensor, "batch n_features"] = einops.einsum(
+            residual, self.W_E, "batch d_embed, n_features d_embed -> batch n_features"
         )
-
         return out
 
 
@@ -144,133 +95,165 @@ class SparseFeatureDataset:
 
     def __init__(
         self,
-        n_instances: int,
-        n_features: int,
-        feature_probability: float,
-        device: str,
+        config: Config,
     ):
-        self.n_instances = n_instances
-        self.n_features = n_features
-        self.feature_probability = feature_probability
-        self.device = device
+        self.n_features = config.n_features
+        self.feature_probability = config.feature_probability
+        self.device = config.device
 
-    def generate_batch(self, batch_size: int) -> tuple[Tensor, Tensor]:
-        """
-        Generate a batch of sparse input features and corresponding labels.
-
-        Args:
-            batch_size: Number of samples in the batch
-
-        Returns:
-            Tuple of (inputs, labels)
-            - inputs: Tensor of shape [batch_size, n_instances, n_features]
-            - labels: Tensor of shape [batch_size, n_instances, n_features]
-        """
-        # Generate input batch where each feature has a probability of being non-zero
-        batch = torch.zeros(batch_size, self.n_instances, self.n_features, device=self.device)
+    def generate_batch(
+        self, batch_size: int
+    ) -> tuple[Float[Tensor, "batch n_features"], Float[Tensor, "batch n_features"]]:
+        batch = torch.zeros((batch_size, self.n_features), device=self.device)
         mask = torch.rand_like(batch) < self.feature_probability
-
-        # Set non-zero values to random values between [-1, 1]
         values = torch.rand_like(batch) * 2 - 1
         batch = values * mask
-
-        # Calculate labels using act_fn(x) + x
         labels = F.relu(batch) + batch
-
         return batch, labels
 
 
-def train_and_evaluate(config: Config, device: str = "cpu"):
-    """Train and evaluate the ResidualMLP model."""
-    # Set random seed for reproducibility
+def train(config: Config) -> ResidualMLPModel:
     torch.manual_seed(config.seed)
     np.random.seed(config.seed)
 
-    # Create model
-    model = ResidualMLPModel(config).to(device)
-
-    # Create dataset and optimizer
-    dataset = SparseFeatureDataset(
-        n_instances=config.n_instances,
-        n_features=config.n_features,
-        feature_probability=config.feature_probability,
-        device=device,
-    )
-
+    model = ResidualMLPModel(config).to(config.device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=config.lr, weight_decay=0.01)
 
-    # Training loop
+    dataset = SparseFeatureDataset(config)
+
     pbar = tqdm(range(config.steps), desc="Training")
     for step in pbar:
-        # Generate a batch
         batch, labels = dataset.generate_batch(config.batch_size)
-
-        # Forward pass
         optimizer.zero_grad()
         outputs = model(batch)
-
-        # Compute loss (MSE)
-        loss = ((outputs - labels) ** 2).mean()
-
-        # Backward pass and optimization
+        loss = ((outputs - labels) ** 2).mean(dim=(0, 1))
         loss.backward()
         optimizer.step()
 
-        # Log progress
         if step % config.print_freq == 0 or step == config.steps - 1:
             pbar.set_postfix({"loss": f"{loss.item():.2e}"})
 
-    # Evaluation
-    print("\nEvaluation:")
-    model.eval()
+    return model
+
+
+def evaluate(
+    model: ResidualMLPModel, dataset: SparseFeatureDataset, batch_size: int = 10_000
+) -> float:
     with torch.no_grad():
-        # Generate a test batch
-        test_batch, test_labels = dataset.generate_batch(1000)
+        batch, labels = dataset.generate_batch(batch_size)
+        outputs = model(batch)
+        loss = ((outputs - labels) ** 2).mean(dim=(0, 1)).item()
+    return loss
 
-        # Forward pass
-        test_outputs = model(test_batch)
 
-        # Compute MSE loss
-        test_loss = ((test_outputs - test_labels) ** 2).mean().item()
+def plot_loss_of_input_sparsity(
+    models: ResidualMLPModel | list[ResidualMLPModel],
+    feature_probabilities: Iterable[float],
+    config: Config,
+    batch_size: int = 100_000,
+    ax: plt.Axes | None = None,
+    labels: list[str] | None = None,
+) -> plt.Axes:
+    ax = ax or plt.subplots()[1]
+    models = [models] if not isinstance(models, list) else models
 
-        # Compute fraction of positive activations to check sparsity
-        active_inputs = (test_batch != 0).float().mean().item()
+    dataset = SparseFeatureDataset(config)
+    feature_probabilities = np.array(feature_probabilities)
+    naive_losses = naive_loss(config.n_features, config.d_mlp, feature_probabilities)
 
-        print(f"Test MSE: {test_loss:.4e}")
-        nl = naive_loss(
-            config.n_features, config.d_mlp, config.feature_probability, embed="random"
+    for i, model in enumerate(models):
+        with torch.no_grad():
+            losses = []
+            for feature_probability in feature_probabilities:
+                dataset.feature_probability = feature_probability
+                loss = evaluate(model, dataset, batch_size=batch_size)
+                losses.append(loss)
+        losses = np.array(losses)
+
+        ax.scatter(
+            feature_probabilities,
+            losses / feature_probabilities,
+            s=1,
+            label=labels[i] if labels else None,
         )
-        print(f"Naive loss: {nl:.4e}")
-        print(f"Input sparsity: {active_inputs:.4f} (target: {config.feature_probability:.4f})")
 
-        # Create an input that is 0 everywhere except for a single feature 42
-        test_batch = torch.zeros(1, config.n_instances, config.n_features, device=device)
-        test_batch[:, :, 42] = 1
-        test_labels = F.relu(test_batch) + test_batch
-        test_labels = test_labels.to("cpu").detach().numpy()
-        test_outputs = model(test_batch).to("cpu").detach().numpy()
-        # Scatter outputs and labels
-        plt.scatter(range(config.n_features), test_outputs[0, 0], label="outputs", s=1)
-        # plt.scatter(range(config.n_features), test_labels[0, 0], label="labels")
-        plt.legend()
-        plt.show()
+    ax.plot(
+        feature_probabilities,
+        naive_losses / feature_probabilities,
+        label="Naive loss",
+        color="k",
+        ls="--",
+    )
+    ax.set_xscale("log")
+    ax.set_yscale("log")
+    ax.set_xlabel("Feature probability p = (1-S)")
+    ax.set_ylabel("Adjusted loss L / (1-S)")
+    ax.set_title("Loss of input sparsity")
+    ax.legend(ncols=3, loc="lower center")
+    fig = ax.get_figure()
+    return fig
+
+
+def plot_outputs(model: ResidualMLPModel, config: Config, ax: plt.Axes | None = None) -> plt.Axes:
+    ax = ax or plt.subplots()[1]
+    dataset = SparseFeatureDataset(config)
+    batch, labels = dataset.generate_batch(1)
+    with torch.no_grad():
+        outputs = model(batch)
+    ax.scatter(range(config.n_features), outputs[0].cpu(), label="outputs", s=1)
+    ax.scatter(range(config.n_features), labels[0].cpu(), label="labels", s=1)
+    ax.set_xlabel("Feature index")
+    ax.set_ylabel("Output value")
+    active_features = torch.where(batch[0] != 0)[0]
+    ax.set_title(f"Outputs for batch with features {active_features.tolist()}")
+    ax.legend()
+    fig = ax.get_figure()
+    return fig
 
 
 if __name__ == "__main__":
-    # Use GPU if available
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    print(f"Using device: {device}")
-
-    # Create config
     config = Config(
         n_features=100,
-        d_embed=100,
+        d_embed=1000,
         d_mlp=50,
-        n_instances=1,
         feature_probability=0.01,
-        steps=5000,
-        batch_size=256,
+        steps=10_000,
+        batch_size=2048,
+        device="cuda" if torch.cuda.is_available() else "cpu",
     )
-
-    # Train and evaluate model
-    model = train_and_evaluate(config, device)
+    # Train model for different numbers of training steps
+    models = []
+    training_steps = [100, 2000, 5000, 10000, 20000, 50000]
+    for n_train in training_steps:
+        config.steps = n_train
+        model = train(config)
+        models.append(model)
+    config.steps = 10_000
+    fig = plot_loss_of_input_sparsity(
+        models,
+        labels=[f"{n_train} steps" for n_train in training_steps],
+        feature_probabilities=np.geomspace(0.001, 1, 100),
+        config=config,
+    )
+    fig.savefig("loss_of_input_sparsity_vs_training_steps.png")
+    fig.show()
+    # Train model at training different sparsities
+    models = []
+    training_feature_probabilities = np.geomspace(0.001, 1, 10)
+    for feature_probability in training_feature_probabilities:
+        config.feature_probability = feature_probability
+        model = train(config)
+        models.append(model)
+    config.feature_probability = 0.01
+    fig = plot_loss_of_input_sparsity(
+        models,
+        labels=[
+            f"{feature_probability:.2e}" for feature_probability in training_feature_probabilities
+        ],
+        feature_probabilities=np.geomspace(0.001, 1, 100),
+        config=config,
+    )
+    ax = fig.get_axes()[0]
+    ax.set_title("Loss of input sparsity for different training feature probabilities")
+    fig.savefig("loss_of_input_sparsity_vs_training_feature_probabilities.png")
+    fig.show()
